@@ -2,41 +2,46 @@ package com.voiceobject.sdk.core.engines
 
 import android.content.Context
 import com.google.mediapipe.tasks.genai.llminference.LlmInference
-import java.io.File
+import com.google.mediapipe.tasks.genai.llminference.LlmInferenceSession
 
 class LlmEngine(private val context: Context) {
+
     private var llmInference: LlmInference? = null
 
-    fun setup(modelPath: String, maxTokens: Int) {
-        val file = File(modelPath)
-        
-        // Verificamos si la ruta es un archivo existente en el sistema de archivos
-        val finalPath = if (file.exists()) {
-            modelPath
-        } else {
-            // Lógica legacy: Copiar de assets si no es una ruta absoluta válida
-            val assetFile = File(context.filesDir, "voiceobject_model.task")
-            if (!assetFile.exists()) {
-                context.assets.open(modelPath).use { input ->
-                    java.io.FileOutputStream(assetFile).use { output -> input.copyTo(output) }
-                }
-            }
-            assetFile.absolutePath
-        }
+    fun setup(
+        modelPath: String,
+        maxTokens: Int,
+        topK: Int
+    ) {
+        llmInference?.close()
+        llmInference = null
 
         val options = LlmInference.LlmInferenceOptions.builder()
-            .setModelPath(finalPath)
+            .setModelPath(modelPath)
             .setMaxTokens(maxTokens)
+            .setMaxTopK(topK)
             .build()
 
         llmInference = LlmInference.createFromOptions(context, options)
     }
 
     fun generate(prompt: String): String? {
-        return llmInference?.generateResponse(prompt)
+        val inference = llmInference ?: return null
+
+        val sessionOptions =
+            LlmInferenceSession.LlmInferenceSessionOptions.builder()
+                .build()
+
+        return LlmInferenceSession
+            .createFromOptions(inference, sessionOptions)
+            .use { session ->
+                session.addQueryChunk(prompt)
+                session.generateResponse()
+            }
     }
 
     fun close() {
         llmInference?.close()
+        llmInference = null
     }
 }

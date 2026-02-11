@@ -52,43 +52,67 @@ class ExampleUnitTest {
 }
 
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
++++ Archivo: ./voiceobject-core/src/main/kotlin/com/voiceobject/sdk/VoiceObjectListener.kt
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+package com.voiceobject.sdk.core
+
+interface VoiceObjectListener {
+    fun onReady(isReady: Boolean)
+    fun onResult(jsonResult: String)
+    fun onError(error: String)
+}
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 +++ Archivo: ./voiceobject-core/src/main/kotlin/com/voiceobject/sdk/core/engines/LlmEngine.kt
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-// LlmEngine.kt
 package com.voiceobject.sdk.core.engines
 
 import android.content.Context
 import com.google.mediapipe.tasks.genai.llminference.LlmInference
-import java.io.File
-import java.io.FileOutputStream
+import com.google.mediapipe.tasks.genai.llminference.LlmInferenceSession
 
 class LlmEngine(private val context: Context) {
-    private var llmInference: LlmInference? = null
-    fun setup(modelPath: String, maxTokens: Int) {
-        val modelFile = File(context.filesDir, "voiceobject_model.task")
 
-        if (!modelFile.exists()) {
-            context.assets.open(modelPath).use { input ->
-                FileOutputStream(modelFile).use { output -> input.copyTo(output) }
-            }
-        }
+    private var llmInference: LlmInference? = null
+
+    fun setup(
+        modelPath: String,
+        maxTokens: Int,
+        topK: Int
+    ) {
+        llmInference?.close()
+        llmInference = null
 
         val options = LlmInference.LlmInferenceOptions.builder()
-            .setModelPath(modelFile.absolutePath)
+            .setModelPath(modelPath)
             .setMaxTokens(maxTokens)
+            .setMaxTopK(topK)
             .build()
 
         llmInference = LlmInference.createFromOptions(context, options)
     }
 
     fun generate(prompt: String): String? {
-        return llmInference?.generateResponse(prompt)
+        val inference = llmInference ?: return null
+
+        val sessionOptions =
+            LlmInferenceSession.LlmInferenceSessionOptions.builder()
+                .build()
+
+        return LlmInferenceSession
+            .createFromOptions(inference, sessionOptions)
+            .use { session ->
+                session.addQueryChunk(prompt)
+                session.generateResponse()
+            }
     }
 
     fun close() {
         llmInference?.close()
+        llmInference = null
     }
 }
+
 
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 +++ Archivo: ./voiceobject-core/src/main/kotlin/com/voiceobject/sdk/core/engines/VoiceEngine.kt
@@ -97,74 +121,191 @@ package com.voiceobject.sdk.core.engines
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.content.res.AssetManager
+import android.content.Intent
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
-import com.k2fsa.sherpa.onnx.* // Importa todo de Sherpa
+import android.os.Bundle
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.util.Log
+import com.k2fsa.sherpa.onnx.*
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class VoiceEngine(private val context: Context) {
 
+    // --- Whisper Variables ---
     private var recognizer: OfflineRecognizer? = null
     private val sampleRate = 16000
     private val isRecording = AtomicBoolean(false)
-    private val audioData = mutableListOf<Short>()
+    private val rawAudioData = ByteArrayOutputStream()
 
-    fun initModel(assetManager: AssetManager) {
+    // --- Init for Whisper ---
+    fun initWhisper(encoderPath: String, decoderPath: String, tokensPath: String) {
+        if (encoderPath.isEmpty()) return // Skip si no se usa Whisper
+
         val config = OfflineRecognizerConfig()
-
-        config.modelConfig.whisper.encoder = "tiny-encoder.int8.onnx"
-        config.modelConfig.whisper.decoder = "tiny-decoder.int8.onnx"
-
-        config.modelConfig.tokens = "tiny-tokens.txt"
-
+        config.modelConfig.whisper.encoder = encoderPath
+        config.modelConfig.whisper.decoder = decoderPath
+        config.modelConfig.tokens = tokensPath
         config.modelConfig.whisper.language = "es"
-        config.modelConfig.whisper.task = "transcribe"
         config.modelConfig.modelType = "whisper"
         config.modelConfig.numThreads = 4
-
-        recognizer = OfflineRecognizer(assetManager, config)
+        config.modelConfig.debug = false
+        recognizer = OfflineRecognizer(config = config)
     }
+
+    // --- Whisper Recording ---
     @SuppressLint("MissingPermission")
-    fun startRecording() {
-        audioData.clear()
+    fun startAudioCapture() {
+        if (isRecording.get()) return
+        rawAudioData.reset()
         isRecording.set(true)
-        val bufferSize = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-        val recorder = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize)
-        Thread {
-            val buffer = ShortArray(bufferSize)
-            recorder.startRecording()
-            while (isRecording.get()) {
-                val read = recorder.read(buffer, 0, buffer.size)
-                if (read > 0) synchronized(audioData) { for (i in 0 until read) audioData.add(buffer[i]) }
-            }
-            recorder.stop()
-            recorder.release()
-        }.start()
+
+        try {
+            val bufferSize = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            val recorder = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize)
+
+            Thread {
+                val buffer = ByteArray(bufferSize)
+                try {
+                    recorder.startRecording()
+                    while (isRecording.get()) {
+                        val read = recorder.read(buffer, 0, buffer.size)
+                        if (read > 0) {
+                            synchronized(rawAudioData) {
+                                rawAudioData.write(buffer, 0, read)
+                            }
+                        }
+                    }
+                } catch (e: Exception) { e.printStackTrace() }
+                finally {
+                    try { recorder.stop(); recorder.release() } catch(e: Exception){}
+                }
+            }.start()
+        } catch (e: Exception) { isRecording.set(false) }
     }
 
-    fun stopRecording(): FloatArray {
+    fun stopAudioCapture(): FloatArray {
         isRecording.set(false)
-        val captured = synchronized(audioData) { audioData.toShortArray() }
-        if (captured.isEmpty()) return floatArrayOf()
-        return FloatArray(captured.size) { i -> captured[i] / 32768.0f }
+        Thread.sleep(100)
+
+        val bytes = synchronized(rawAudioData) { rawAudioData.toByteArray() } // Obtener array directo
+        rawAudioData.reset()
+
+        if (bytes.isEmpty()) return floatArrayOf()
+        val shorts = ShortArray(bytes.size / 2)
+        ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(shorts)
+        return FloatArray(shorts.size) { i -> shorts[i] / 32768.0f }
     }
 
-    fun transcribe(samples: FloatArray): String {
-        if (recognizer == null || samples.isEmpty()) return ""
+    fun stopAudioCaptureAndGetWav(): ByteArray {
+        isRecording.set(false)
+        Thread.sleep(100)
+        val pcmData = synchronized(rawAudioData) { rawAudioData.toByteArray() }
+        rawAudioData.reset()
+        if (pcmData.isEmpty()) return ByteArray(0)
+        return addWavHeader(pcmData)
+    }
+
+    private fun addWavHeader(pcmData: ByteArray): ByteArray {
+        val header = ByteArray(44)
+        val totalDataLen = pcmData.size.toLong()
+        val byteRate = (16000 * 1 * 16 / 8).toLong() // SampleRate * Channels * Bits / 8
+        val totalChunkSize = totalDataLen + 36
+
+        header[0] = 'R'.code.toByte(); header[1] = 'I'.code.toByte(); header[2] = 'F'.code.toByte(); header[3] = 'F'.code.toByte()
+        header[4] = (totalChunkSize and 0xff).toByte()
+        header[5] = ((totalChunkSize shr 8) and 0xff).toByte()
+        header[6] = ((totalChunkSize shr 16) and 0xff).toByte()
+        header[7] = ((totalChunkSize shr 24) and 0xff).toByte()
+        header[8] = 'W'.code.toByte(); header[9] = 'A'.code.toByte(); header[10] = 'V'.code.toByte(); header[11] = 'E'.code.toByte()
+        header[12] = 'f'.code.toByte(); header[13] = 'm'.code.toByte(); header[14] = 't'.code.toByte(); header[15] = ' '.code.toByte()
+        header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0 // Length of format data
+        header[20] = 1; header[21] = 0 // Type of format (1 is PCM)
+        header[22] = 1; header[23] = 0 // Channels (1)
+        header[24] = (16000 and 0xff).toByte(); header[25] = ((16000 shr 8) and 0xff).toByte() // Sample Rate
+        header[26] = ((16000 shr 16) and 0xff).toByte(); header[27] = ((16000 shr 24) and 0xff).toByte()
+        header[28] = (byteRate and 0xff).toByte(); header[29] = ((byteRate shr 8) and 0xff).toByte()
+        header[30] = ((byteRate shr 16) and 0xff).toByte(); header[31] = ((byteRate shr 24) and 0xff).toByte()
+        header[32] = 2; header[33] = 0 // Block align (Channels * Bits / 8)
+        header[34] = 16; header[35] = 0 // Bits per sample
+        header[36] = 'd'.code.toByte(); header[37] = 'a'.code.toByte(); header[38] = 't'.code.toByte(); header[39] = 'a'.code.toByte()
+        header[40] = (totalDataLen and 0xff).toByte()
+        header[41] = ((totalDataLen shr 8) and 0xff).toByte()
+        header[42] = ((totalDataLen shr 16) and 0xff).toByte()
+        header[43] = ((totalDataLen shr 24) and 0xff).toByte()
+
+        return header + pcmData
+    }
+    fun transcribeWhisper(samples: FloatArray): String {
+        if (recognizer == null) return "Error: Whisper no inicializado"
+        if (samples.isEmpty()) return ""
         val stream = recognizer!!.createStream()
         stream.acceptWaveform(samples, sampleRate)
         recognizer!!.decode(stream)
         val result = recognizer!!.getResult(stream)
+        stream.release()
         return result.text
     }
 
+    // --- Native Android STT ---
+    suspend fun recognizeNative(): String = withContext(Dispatchers.Main) {
+        suspendCoroutine { cont ->
+            if (!SpeechRecognizer.isRecognitionAvailable(context)) {
+                cont.resume("")
+                return@suspendCoroutine
+            }
+
+            val speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context)
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-ES")
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
+            }
+
+            speechRecognizer.setRecognitionListener(object : RecognitionListener {
+                override fun onReadyForSpeech(params: Bundle?) {}
+                override fun onBeginningOfSpeech() {}
+                override fun onRmsChanged(rmsdB: Float) {}
+                override fun onBufferReceived(buffer: ByteArray?) {}
+                override fun onEndOfSpeech() {}
+
+                override fun onError(error: Int) {
+                    Log.e("VoiceEngine", "Native STT Error code: $error")
+                    speechRecognizer.destroy()
+                    cont.resume("") // Retornar vacío en error
+                }
+
+                override fun onResults(results: Bundle?) {
+                    val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    val text = matches?.firstOrNull() ?: ""
+                    speechRecognizer.destroy()
+                    cont.resume(text)
+                }
+
+                override fun onPartialResults(partialResults: Bundle?) {}
+                override fun onEvent(eventType: Int, params: Bundle?) {}
+            })
+
+            speechRecognizer.startListening(intent)
+        }
+    }
+
     fun release() {
+        isRecording.set(false)
         recognizer?.release()
         recognizer = null
     }
-
 }
 
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -173,148 +314,442 @@ class VoiceEngine(private val context: Context) {
 package com.voiceobject.sdk.core.prompt
 
 class SchemaInference {
-    fun generatePrompt(userTranscript: String, fields: Map<String, String>): String {
-        val schemaText = fields.entries.joinToString(",\n") { (key, desc) ->
-            "  \"$key\": \"$desc\""
+
+    fun generatePrompt(
+        userTranscript: String,
+        fields: Map<String, String>,
+        additionalSystemInstruction: String? = null
+    ): String {
+
+        val schemaTypes = fields.entries.joinToString(",\n") { (key, desc) ->
+            """  "$key": $desc"""
+        }
+
+        val systemBase = """
+        Eres un motor determinista de extracción estructurada.
+        
+        REGLAS:
+        - Devuelve SOLO JSON válido.
+        - No agregues texto adicional.
+        - No inventes valores.
+        - Si el dato no está explícito, usa null.
+        - Respeta estrictamente los tipos definidos.
+        """.trimIndent()
+
+        val finalSystemInstruction = if (!additionalSystemInstruction.isNullOrBlank()) {
+            systemBase + "\n\nINSTRUCCIONES ADICIONALES:\n" + additionalSystemInstruction
+        } else {
+            systemBase
         }
 
         return """
-            Actúa como un extractor de datos profesional. 
-            Convierte la siguiente transcripción en un JSON válido basado estrictamente en el esquema proporcionado.
-            
-            ESQUEMA REQUERIDO:
-            {
-            $schemaText
-            }
-            
-            REGLAS:
-            1. Usa null si el dato no existe.
-            2. Respuesta técnica y concisa.
-            3. SOLO responde el JSON.
-
-            TRANSCRIPCIÓN: "$userTranscript"
-            {
+        $finalSystemInstruction
+        
+        ESQUEMA:
+        {
+        $schemaTypes
+        }
+        
+        TRANSCRIPCIÓN:
+        $userTranscript
+        
+        JSON:
         """.trimIndent()
     }
 }
+
 
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 +++ Archivo: ./voiceobject-core/src/main/kotlin/com/voiceobject/sdk/core/VoiceObjectClient.kt
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 package com.voiceobject.sdk.core
 
+import android.Manifest
 import android.content.Context
-import android.util.Log // Added missing import
+import android.content.pm.PackageManager
+import android.util.Log
+import androidx.core.content.ContextCompat
+import com.voiceobject.sdk.core.config.LlmModelVersion
+import com.voiceobject.sdk.core.config.SttProvider
 import com.voiceobject.sdk.core.engines.LlmEngine
 import com.voiceobject.sdk.core.engines.VoiceEngine
 import com.voiceobject.sdk.core.prompt.SchemaInference
+import com.voiceobject.sdk.core.utils.ModelPaths
 import kotlinx.coroutines.*
-import kotlin.system.measureTimeMillis
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 
 class VoiceObjectClient private constructor(
     private val context: Context,
-    private val gemmaAsset: String,
-    private val whisperEncoder: String,
+    private val modelPaths: ModelPaths,
     private val schema: Map<String, String>,
-    private val maxTokens: Int
+    private val maxTokens: Int,
+    private val topK: Int,
+    private val additionalSystemInstruction: String?,
+    private val sttProvider: SttProvider
 ) {
+
     private val voiceEngine = VoiceEngine(context)
     private val llmEngine = LlmEngine(context)
     private val promptBuilder = SchemaInference()
-
-    // Optimization: Use SupervisorJob so one failure doesn't kill the whole scope
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    @Volatile private var isVoiceReady = false
-    @Volatile private var isLlmReady = false
-    private var chanel: MethodChannel? = null
+    @Volatile private var isReady = false
+    private var listener: VoiceObjectListener? = null
 
-    fun initialize(channel: MethodChannel, onReady: (Boolean) -> Unit) {
-        this.channel = channel
+    fun setListener(listener: VoiceObjectListener) {
+        this.listener = listener
+    }
+
+    fun initialize() {
         scope.launch {
             try {
-                Log.d("VoiceObjectSDK", "Starting parallel initialization...")
+                llmEngine.setup(
+                    modelPath = modelPaths.gemmaModel,
+                    maxTokens = maxTokens,
+                    topK = topK
+                )
 
-                val voiceInit = async {
-                    val time = measureTimeMillis { voiceEngine.initModel(context.assets) }
-                    isVoiceReady = true
-                    Log.d("VoiceObjectSDK", "✅ Whisper ready (${time}ms)")
+                if (sttProvider == SttProvider.WHISPER_ONNX) {
+                    voiceEngine.initWhisper(
+                        modelPaths.whisperEncoder,
+                        modelPaths.whisperDecoder,
+                        modelPaths.whisperTokens
+                    )
                 }
 
-                val llmInit = async {
-                    val time = measureTimeMillis { llmEngine.setup(gemmaAsset, maxTokens) }
-                    isLlmReady = true
-                    Log.d("VoiceObjectSDK", "✅ Gemma ready (${time}ms)")
-                }
+                isReady = true
+                withContext(Dispatchers.Main) { listener?.onReady(true) }
 
-                // Wait for both to complete
-                awaitAll(voiceInit, llmInit)
-
-                withContext(Dispatchers.Main { onReady(true) }
             } catch (e: Exception) {
-                Log.e("VoiceObjectSDK", "❌ Initialization failed", e)
-                withContext(Dispatchers.Main) { onReady(false) }
-        }
-    }
-
-    /**
-     * Clean up resources to prevent memory leaks when the client is no longer needed.
-     */
-    fun release() {
-        scope.cancel()
-    }
-
-    fun startAction() {
-        if (!isVoiceReady) {
-            Log.e("VoiceObjectSDK", "Cannot start: VoiceEngine not ready")
-            return
-        }
-        voiceEngine.startRecording()
-    }
-
-        fun stopAction() {
-            scope.launch {
-                val audioSamples = voiceEngine.stopRecording()
-                if (audioSamples.isEmpty()) {
-                    sendToFlutter("onFinalResult", "{\"error\": \"No se detectó audio\"}")
-                    return@launch
+                Log.e("VoiceObjectSDK", "Init Error", e)
+                withContext(Dispatchers.Main) {
+                    listener?.onReady(false)
+                    listener?.onError(e.message ?: "Unknown Error")
                 }
-
-                val transcription = withContext(Dispatchers.Default) {
-                    voiceEngine.transcribe(audioSamples)
-                }
-
-                if (transcription.isBlank()) {
-                    sendToFlutter("onFinalResult", "{\"error\": \"Whisper no entendió\"}")
-                    return@launch
-                }
-
-                val jsonResponse = withContext(Dispatchers.Default) {
-                    val finalPrompt = promptBuilder.generatePrompt(transcription, schema)
-                    llmEngine.generate(finalPrompt)
-                }
-
-                sendToFlutter("onFinalResult", jsonResponse ?: "{}")
             }
         }
     }
-    private fun sendToFlutter(method: String, data: Any) {
-        scope.launch(Dispatchers.Main) {
-            channel?.invokeMethod(method, data)
+
+    fun startAction() {
+        if (!isReady) {
+            listener?.onError("SDK not ready")
+            return
+        }
+
+        if (sttProvider == SttProvider.ANDROID_NATIVE) {
+            scope.launch { processNativeStt() }
+        } else {
+            if (checkPermissions()) {
+                voiceEngine.startAudioCapture()
+            } else {
+                listener?.onError("Permission RECORD_AUDIO denied")
+            }
         }
     }
-    class Builder(private val context: Context) {
-        private var gemmaAsset = ""
-        private var schema = emptyMap<String, String>()
-        private var maxTokens = 1024
 
-        fun setModels(gemma: String, encoder: String, decoder: String, tokens: String) = apply {
-            this.gemmaAsset = gemma
+    fun stopAction() {
+        if (sttProvider == SttProvider.ANDROID_NATIVE) return
+
+        scope.launch {
+            try {
+                val audioFloats = voiceEngine.stopAudioCapture()
+                val text = voiceEngine.transcribeWhisper(audioFloats)
+                processTextWithLlm(text)
+            } catch (e: Exception) {
+                notifyError("Error procesamiento: ${e.message}")
+            }
         }
+    }
+
+    private suspend fun processNativeStt() {
+        val text = voiceEngine.recognizeNative()
+
+        if (text.isNotBlank()) {
+            processTextWithLlm(text)
+        } else {
+            withContext(Dispatchers.Main) {
+                listener?.onError("No se detectó voz (Nativo)")
+            }
+        }
+    }
+
+    private suspend fun processTextWithLlm(text: String) {
+        Log.d("VoiceObjectSDK", "Texto detectado: $text")
+        if (text.isBlank()) return
+
+        val prompt = promptBuilder.generatePrompt(
+            userTranscript = text,
+            fields = schema,
+            additionalSystemInstruction = additionalSystemInstruction
+        )
+
+        var response = llmEngine.generate(prompt) ?: "{}"
+        response = cleanMarkdown(response)
+
+        val clean = sanitizeJsonOutput(response.trim())
+        sendResult(clean)
+    }
+
+    private fun cleanMarkdown(response: String): String {
+        var clean = response
+        if (clean.contains("```json")) {
+            clean = clean.substringAfter("```json").substringBefore("```")
+        } else if (clean.contains("```")) {
+            clean = clean.substringAfter("```").substringBefore("```")
+        }
+        return clean.trim()
+    }
+
+    private fun sanitizeJsonOutput(raw: String): String {
+        return try {
+            val gson = Gson()
+            val type = object : TypeToken<Map<String, Any?>>() {}.type
+            val map: Map<String, Any?> = gson.fromJson(raw, type)
+            gson.toJson(map)
+        } catch (e: Exception) {
+            "{}"
+        }
+    }
+
+    private suspend fun sendResult(json: String?) {
+        withContext(Dispatchers.Main) {
+            listener?.onResult(json ?: "{}")
+        }
+    }
+
+    private fun checkPermissions(): Boolean {
+        return ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private suspend fun notifyError(msg: String) {
+        withContext(Dispatchers.Main) {
+            listener?.onError(msg)
+        }
+    }
+
+    fun release() {
+        voiceEngine.release()
+        llmEngine.close()
+        scope.cancel()
+    }
+
+    // =========================
+    // BUILDER
+    // =========================
+
+    class Builder(private val context: Context) {
+
+        private var modelPaths: ModelPaths? = null
+        private var schema = emptyMap<String, String>()
+        private var maxTokens = 512
+        private var topK = 1
+        private var additionalSystemInstruction: String? = null
+        private var sttProvider = SttProvider.ANDROID_NATIVE
+
+        fun setModelPaths(paths: ModelPaths) = apply { this.modelPaths = paths }
         fun setSchema(schema: Map<String, String>) = apply { this.schema = schema }
         fun setMaxTokens(tokens: Int) = apply { this.maxTokens = tokens }
+        fun setTopK(value: Int) = apply { this.topK = value }
+        fun setSystemInstruction(instruction: String) = apply { this.additionalSystemInstruction = instruction }
+        fun setSttProvider(provider: SttProvider) = apply { this.sttProvider = provider }
 
-        fun build() = VoiceObjectClient(context, gemmaAsset, "", schema, maxTokens)
+        fun build(): VoiceObjectClient {
+            requireNotNull(modelPaths) { "ModelPaths required" }
+
+            return VoiceObjectClient(
+                context,
+                modelPaths!!,
+                schema,
+                maxTokens,
+                topK,
+                additionalSystemInstruction,
+                sttProvider
+            )
+        }
+    }
+}
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
++++ Archivo: ./voiceobject-core/src/main/kotlin/com/voiceobject/sdk/core/config/VoiceConfiguration.kt
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+package com.voiceobject.sdk.core.config
+
+enum class LlmModelVersion(
+    val url: String,
+    val fileName: String,
+    val isAudioNative: Boolean // Indica si el modelo procesa audio directamente (Gemma 3n)
+) {
+    GEMMA_3_1B(
+        url = "https://huggingface.co/litert-community/Gemma3-1B-IT/resolve/main/gemma3-1b-it-int4.task?download=true",
+        fileName = "gemma3-1b-it-int4.task",
+        isAudioNative = false
+    ),
+    GEMMA_3_270M(
+        url = "https://huggingface.co/litert-community/gemma-3-270m-it/resolve/main/gemma3-270m-it-q8.litertlm?download=true",
+        fileName = "gemma3-270m-it-q8.litertlm",
+        isAudioNative = false
+    ),
+    GEMMA_3N_2B(
+        url = "https://huggingface.co/google/gemma-3n-E2B-it-litert-lm/resolve/main/gemma-3n-E2B-it-int4-Web.litertlm?download=true",
+        fileName = "gemma-3n-E2B-it-int4-Web.litertlm",
+        isAudioNative = false
+    )
+}
+
+enum class SttProvider {
+    WHISPER_ONNX,
+    ANDROID_NATIVE,
+    NONE
+}
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
++++ Archivo: ./voiceobject-core/src/main/kotlin/com/voiceobject/sdk/core/utils/ModelManager.kt
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+package com.voiceobject.sdk.core.utils
+
+import android.content.Context
+import android.util.Log
+import com.voiceobject.sdk.core.config.LlmModelVersion
+import com.voiceobject.sdk.core.config.SttProvider
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.util.concurrent.TimeUnit
+data class ModelSpec(
+    val fileName: String,
+    val url: String,
+    val type: ModelType
+)
+
+enum class ModelType { WHISPER_ENCODER, WHISPER_DECODER, WHISPER_TOKENS, LLM_GEMMA }
+
+data class ModelPaths(
+    val whisperEncoder: String,
+    val whisperDecoder: String,
+    val whisperTokens: String,
+    val gemmaModel: String
+)
+
+interface DownloadListener {
+    fun onProgress(fileName: String, progress: Int)
+    fun onError(error: String)
+    fun onAllFinished(paths: ModelPaths)
+}
+
+class ModelManager(private val context: Context, private val hfToken: String) {
+
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(120, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
+        .build()
+
+    // Ahora pasamos la configuración para saber qué descargar
+    suspend fun checkAndDownloadModels(
+        llmVersion: LlmModelVersion,
+        sttProvider: SttProvider,
+        listener: DownloadListener
+    ) {
+        withContext(Dispatchers.IO) {
+            val specsToDownload = mutableListOf<ModelSpec>()
+
+            // 1. Agregar el LLM seleccionado
+            specsToDownload.add(
+                ModelSpec(llmVersion.fileName, llmVersion.url, ModelType.LLM_GEMMA)
+            )
+
+            // 2. Agregar Whisper SOLO si el proveedor es WHISPER_ONNX
+            // Si es Gemma 3N (Audio Native) o Android Native, NO descargamos Whisper
+            if (sttProvider == SttProvider.WHISPER_ONNX) {
+                specsToDownload.add(ModelSpec("tiny-encoder.int8.onnx", "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-tiny/resolve/main/tiny-encoder.int8.onnx", ModelType.WHISPER_ENCODER))
+                specsToDownload.add(ModelSpec("tiny-decoder.int8.onnx", "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-tiny/resolve/main/tiny-decoder.int8.onnx", ModelType.WHISPER_DECODER))
+                specsToDownload.add(ModelSpec("tiny-tokens.txt", "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-tiny/resolve/main/tiny-tokens.txt", ModelType.WHISPER_TOKENS))
+            }
+
+            val finalPaths = mutableMapOf<ModelType, String>()
+            var hasError = false
+
+            for (spec in specsToDownload) {
+                if (hasError) break
+                val file = File(context.filesDir, spec.fileName)
+
+                if (file.exists() && file.length() > 0) {
+                    Log.d("VoiceObjectSDK", "Modelo ya existe: ${spec.fileName}")
+                    finalPaths[spec.type] = file.absolutePath
+                    listener.onProgress(spec.fileName, 100)
+                } else {
+                    // Borrar si existe corrupto
+                    if (file.exists()) file.delete()
+
+                    val success = downloadFile(spec.url, file) { p ->
+                        listener.onProgress(spec.fileName, p)
+                    }
+
+                    if (success) finalPaths[spec.type] = file.absolutePath
+                    else {
+                        hasError = true
+                        listener.onError("Fallo descarga: ${spec.fileName}")
+                    }
+                }
+            }
+
+            if (!hasError) {
+                listener.onAllFinished(ModelPaths(
+                    whisperEncoder = finalPaths[ModelType.WHISPER_ENCODER] ?: "",
+                    whisperDecoder = finalPaths[ModelType.WHISPER_DECODER] ?: "",
+                    whisperTokens = finalPaths[ModelType.WHISPER_TOKENS] ?: "",
+                    gemmaModel = finalPaths[ModelType.LLM_GEMMA] ?: ""
+                ))
+            }
+        }
+    }
+
+    private fun downloadFile(url: String, file: File, onProgress: (Int) -> Unit): Boolean {
+        val requestBuilder = Request.Builder().url(url)
+        if (url.contains("huggingface.co") && hfToken.isNotEmpty()) {
+            requestBuilder.addHeader("authorization", "Bearer $hfToken")
+        }
+        val request = requestBuilder.build()
+
+        try {
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) return false
+                val body = response.body ?: return false
+                val totalSize = body.contentLength()
+
+                body.byteStream().use { input ->
+                    FileOutputStream(file).use { output ->
+                        val buffer = ByteArray(8 * 1024)
+                        var bytesCopied: Long = 0
+                        var read: Int
+                        var lastProgress = 0
+                        while (input.read(buffer).also { read = it } != -1) {
+                            output.write(buffer, 0, read)
+                            bytesCopied += read
+                            if (totalSize > 0) {
+                                val progress = ((bytesCopied * 100) / totalSize).toInt()
+                                if (progress > lastProgress) {
+                                    lastProgress = progress
+                                    try { onProgress(progress) } catch (_: Exception) {}
+                                }
+                            }
+                        }
+                    }
+                }
+                return true
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            return false
+        }
     }
 }
 

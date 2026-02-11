@@ -1,26 +1,46 @@
 package com.voiceobject.sdk.core.prompt
 
 class SchemaInference {
-    fun generatePrompt(userTranscript: String, fields: Map<String, String>): String {
-        val schemaText = fields.entries.joinToString(",\n") { (key, desc) ->
-            "  \"$key\": \"$desc\""
+
+    fun generatePrompt(
+        userTranscript: String,
+        fields: Map<String, String>,
+        additionalSystemInstruction: String? = null
+    ): String {
+
+        val schemaTypes = fields.entries.joinToString(",\n") { (key, desc) ->
+            """  "$key": $desc"""
+        }
+
+        val systemBase = """
+        Eres un motor determinista de extracción estructurada.
+        
+        REGLAS:
+        - Devuelve SOLO JSON válido.
+        - No agregues texto adicional.
+        - No inventes valores.
+        - Si el dato no está explícito, usa null.
+        - Respeta estrictamente los tipos definidos.
+        """.trimIndent()
+
+        val finalSystemInstruction = if (!additionalSystemInstruction.isNullOrBlank()) {
+            systemBase + "\n\nINSTRUCCIONES ADICIONALES:\n" + additionalSystemInstruction
+        } else {
+            systemBase
         }
 
         return """
-            Actúa como un extractor de datos profesional. 
-            Convierte la siguiente transcripción en un JSON válido basado estrictamente en el esquema proporcionado.
-            
-            ESQUEMA REQUERIDO:
-            {
-            $schemaText
-            }
-            
-            REGLAS:
-            1. Usa null si el dato no existe.
-            2. SOLO responde el JSON.
-
-            TRANSCRIPCIÓN: "$userTranscript"
-            {
+        $finalSystemInstruction
+        
+        ESQUEMA:
+        {
+        $schemaTypes
+        }
+        
+        TRANSCRIPCIÓN:
+        $userTranscript
+        
+        JSON:
         """.trimIndent()
     }
 }

@@ -5,29 +5,32 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.voiceobject.sdk.core.config.LlmModelVersion
+import com.voiceobject.sdk.core.config.SttProvider
 import com.voiceobject.sdk.core.engines.LlmEngine
 import com.voiceobject.sdk.core.engines.VoiceEngine
 import com.voiceobject.sdk.core.prompt.SchemaInference
+import com.voiceobject.sdk.core.utils.ModelPaths
 import kotlinx.coroutines.*
-import kotlin.system.measureTimeMillis
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 
 class VoiceObjectClient private constructor(
     private val context: Context,
-    private val gemmaPath: String,
-    private val whisperEncoderPath: String,
-    private val whisperDecoderPath: String,
-    private val whisperTokensPath: String,
+    private val modelPaths: ModelPaths,
     private val schema: Map<String, String>,
-    private val maxTokens: Int
+    private val maxTokens: Int,
+    private val topK: Int,
+    private val additionalSystemInstruction: String?,
+    private val sttProvider: SttProvider
 ) {
+
     private val voiceEngine = VoiceEngine(context)
     private val llmEngine = LlmEngine(context)
     private val promptBuilder = SchemaInference()
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    @Volatile private var isVoiceReady = false
-    @Volatile private var isLlmReady = false
-    
+    @Volatile private var isReady = false
     private var listener: VoiceObjectListener? = null
 
     fun setListener(listener: VoiceObjectListener) {
@@ -37,94 +40,127 @@ class VoiceObjectClient private constructor(
     fun initialize() {
         scope.launch {
             try {
-                Log.d("VoiceObjectSDK", "Iniciando carga de modelos...")
+                llmEngine.setup(
+                    modelPath = modelPaths.gemmaModel,
+                    maxTokens = maxTokens,
+                    topK = topK
+                )
 
-                val voiceInit = async {
-                    val time = measureTimeMillis { 
-                        voiceEngine.initModel(whisperEncoderPath, whisperDecoderPath, whisperTokensPath) 
-                    }
-                    isVoiceReady = true
-                    Log.d("VoiceObjectSDK", "✅ Whisper cargado (${time}ms)")
+                if (sttProvider == SttProvider.WHISPER_ONNX) {
+                    voiceEngine.initWhisper(
+                        modelPaths.whisperEncoder,
+                        modelPaths.whisperDecoder,
+                        modelPaths.whisperTokens
+                    )
                 }
 
-                val llmInit = async {
-                    val time = measureTimeMillis { 
-                        llmEngine.setup(gemmaPath, maxTokens) 
-                    }
-                    isLlmReady = true
-                    Log.d("VoiceObjectSDK", "✅ Gemma cargado (${time}ms)")
-                }
-
-                awaitAll(voiceInit, llmInit)
-                
+                isReady = true
                 withContext(Dispatchers.Main) { listener?.onReady(true) }
+
             } catch (e: Exception) {
-                Log.e("VoiceObjectSDK", "❌ Error en inicialización", e)
-                withContext(Dispatchers.Main) { 
+                Log.e("VoiceObjectSDK", "Init Error", e)
+                withContext(Dispatchers.Main) {
                     listener?.onReady(false)
-                    listener?.onError("Error al cargar modelos: ${e.message}")
+                    listener?.onError(e.message ?: "Unknown Error")
                 }
             }
         }
     }
 
     fun startAction() {
-        if (!isVoiceReady) {
-            listener?.onError("VoiceEngine no está listo. Llama a initialize() primero.")
+        if (!isReady) {
+            listener?.onError("SDK not ready")
             return
         }
 
-        // VERIFICACIÓN DE SEGURIDAD
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) 
-            != PackageManager.PERMISSION_GRANTED) {
-            listener?.onError("Falta el permiso de RECORD_AUDIO. La app debe solicitarlo al usuario.")
-            return
-        }
-
-        voiceEngine.startRecording()
-    }
-
-    fun stopAction() {
-        scope.launch {
-            try {
-                val audioSamples = voiceEngine.stopRecording()
-                if (audioSamples.isEmpty()) {
-                    notifyError("No se detectó audio")
-                    return@launch
-                }
-
-                val transcription = withContext(Dispatchers.Default) {
-                    voiceEngine.transcribe(audioSamples)
-                }
-
-                if (transcription.isBlank()) {
-                    notifyError("No se pudo transcribir el audio")
-                    return@launch
-                }
-                
-                Log.d("VoiceObjectSDK", "Transcripción: $transcription")
-
-                val jsonResponse = withContext(Dispatchers.Default) {
-                    val finalPrompt = promptBuilder.generatePrompt(transcription, schema)
-                    var response = llmEngine.generate(finalPrompt) ?: "{}"
-                    
-                    if (response.contains("```json")) {
-                        response = response.substringAfter("```json").substringBefore("```")
-                    } else if (response.contains("```")) {
-                        response = response.substringAfter("```").substringBefore("```")
-                    }
-                    response.trim()
-                }
-
-                withContext(Dispatchers.Main) {
-                    listener?.onResult(jsonResponse)
-                }
-            } catch (e: Exception) {
-                notifyError("Error durante el procesamiento: ${e.message}")
+        if (sttProvider == SttProvider.ANDROID_NATIVE) {
+            scope.launch { processNativeStt() }
+        } else {
+            if (checkPermissions()) {
+                voiceEngine.startAudioCapture()
+            } else {
+                listener?.onError("Permission RECORD_AUDIO denied")
             }
         }
     }
-    
+
+    fun stopAction() {
+        if (sttProvider == SttProvider.ANDROID_NATIVE) return
+
+        scope.launch {
+            try {
+                val audioFloats = voiceEngine.stopAudioCapture()
+                val text = voiceEngine.transcribeWhisper(audioFloats)
+                processTextWithLlm(text)
+            } catch (e: Exception) {
+                notifyError("Error procesamiento: ${e.message}")
+            }
+        }
+    }
+
+    private suspend fun processNativeStt() {
+        val text = voiceEngine.recognizeNative()
+
+        if (text.isNotBlank()) {
+            processTextWithLlm(text)
+        } else {
+            withContext(Dispatchers.Main) {
+                listener?.onError("No se detectó voz (Nativo)")
+            }
+        }
+    }
+
+    private suspend fun processTextWithLlm(text: String) {
+        Log.d("VoiceObjectSDK", "Texto detectado: $text")
+        if (text.isBlank()) return
+
+        val prompt = promptBuilder.generatePrompt(
+            userTranscript = text,
+            fields = schema,
+            additionalSystemInstruction = additionalSystemInstruction
+        )
+
+        var response = llmEngine.generate(prompt) ?: "{}"
+        response = cleanMarkdown(response)
+
+        val clean = sanitizeJsonOutput(response.trim())
+        sendResult(clean)
+    }
+
+    private fun cleanMarkdown(response: String): String {
+        var clean = response
+        if (clean.contains("```json")) {
+            clean = clean.substringAfter("```json").substringBefore("```")
+        } else if (clean.contains("```")) {
+            clean = clean.substringAfter("```").substringBefore("```")
+        }
+        return clean.trim()
+    }
+
+    private fun sanitizeJsonOutput(raw: String): String {
+        return try {
+            val gson = Gson()
+            val type = object : TypeToken<Map<String, Any?>>() {}.type
+            val map: Map<String, Any?> = gson.fromJson(raw, type)
+            gson.toJson(map)
+        } catch (e: Exception) {
+            "{}"
+        }
+    }
+
+    private suspend fun sendResult(json: String?) {
+        withContext(Dispatchers.Main) {
+            listener?.onResult(json ?: "{}")
+        }
+    }
+
+    private fun checkPermissions(): Boolean {
+        return ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
     private suspend fun notifyError(msg: String) {
         withContext(Dispatchers.Main) {
             listener?.onError(msg)
@@ -137,41 +173,37 @@ class VoiceObjectClient private constructor(
         scope.cancel()
     }
 
+    // =========================
+    // BUILDER
+    // =========================
+
     class Builder(private val context: Context) {
-        private var gemmaPath = ""
-        private var whisperEncoder = ""
-        private var whisperDecoder = ""
-        private var whisperTokens = ""
+
+        private var modelPaths: ModelPaths? = null
         private var schema = emptyMap<String, String>()
-        private var maxTokens = 1024
+        private var maxTokens = 512
+        private var topK = 1
+        private var additionalSystemInstruction: String? = null
+        private var sttProvider = SttProvider.ANDROID_NATIVE
 
-        fun setModels(
-            gemmaPath: String, 
-            whisperEncoderPath: String, 
-            whisperDecoderPath: String, 
-            whisperTokensPath: String
-        ) = apply {
-            this.gemmaPath = gemmaPath
-            this.whisperEncoder = whisperEncoderPath
-            this.whisperDecoder = whisperDecoderPath
-            this.whisperTokens = whisperTokensPath
-        }
-
+        fun setModelPaths(paths: ModelPaths) = apply { this.modelPaths = paths }
         fun setSchema(schema: Map<String, String>) = apply { this.schema = schema }
         fun setMaxTokens(tokens: Int) = apply { this.maxTokens = tokens }
+        fun setTopK(value: Int) = apply { this.topK = value }
+        fun setSystemInstruction(instruction: String) = apply { this.additionalSystemInstruction = instruction }
+        fun setSttProvider(provider: SttProvider) = apply { this.sttProvider = provider }
 
         fun build(): VoiceObjectClient {
-            if (gemmaPath.isEmpty() || whisperEncoder.isEmpty()) {
-                throw IllegalStateException("Debes configurar las rutas de los modelos antes de construir.")
-            }
+            requireNotNull(modelPaths) { "ModelPaths required" }
+
             return VoiceObjectClient(
-                context, 
-                gemmaPath, 
-                whisperEncoder, 
-                whisperDecoder, 
-                whisperTokens, 
-                schema, 
-                maxTokens
+                context,
+                modelPaths!!,
+                schema,
+                maxTokens,
+                topK,
+                additionalSystemInstruction,
+                sttProvider
             )
         }
     }

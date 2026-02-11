@@ -37,9 +37,10 @@ android {
 }
 
 dependencies {
-    api("com.google.mediapipe:tasks-genai:0.10.25")
+    api("com.google.mediapipe:tasks-genai:0.10.32")
     compileOnly(files("libs/sherpa-onnx-1.10.40.aar"))
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    implementation("com.google.code.gson:gson:2.10.1")
 }
